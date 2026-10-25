@@ -24,6 +24,7 @@ lifecycle.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import socket
@@ -263,6 +264,276 @@ def train(
             return 128 + received.signum
         return 0
     return run_commands(launch)
+
+
+@cli.command(short_help="validate a run config and size it without GPUs")
+@click.option(
+    "-c",
+    "--config",
+    "config_path",
+    required=True,
+    metavar="PATH",
+    help="YAML or JSON run config.",
+)
+@click.option(
+    "--data",
+    "data_path",
+    default=None,
+    metavar="PATH",
+    help=(
+        "Prompt JSONL with input_ids, or a JSON stats file. Defaults to the "
+        "config's prompts_path/train_data_path."
+    ),
+)
+@click.option("--prompt-count", type=int, default=None)
+@click.option("--p50-prompt-tokens", type=int, default=None)
+@click.option("--p95-prompt-tokens", type=int, default=None)
+@click.option("--max-prompt-tokens", type=int, default=None)
+@click.option("--target-hidden-size", type=int, default=None)
+@click.option(
+    "--aux-layer-ids",
+    default=None,
+    metavar="ID,ID,...",
+    help="Capture layer ids; use with --target-hidden-size when the checkpoint is remote.",
+)
+@click.option(
+    "--capture-tps",
+    type=float,
+    default=5000.0,
+    show_default=True,
+    help="Conservative capture throughput for the timeout estimate.",
+)
+@click.option(
+    "--swa-pool-tokens",
+    type=int,
+    default=None,
+    help="Measured SWA token capacity of a whole-prompt capture server.",
+)
+@click.option(
+    "--external-store-bytes",
+    type=int,
+    default=None,
+    help="Declared capacity of an external Mooncake segment, for the capacity check.",
+)
+@click.option("--max-rows", type=int, default=0, show_default=True)
+@click.option("--allow-existing", is_flag=True)
+@click.option("--json-output", is_flag=True)
+@click.argument("overrides", nargs=-1)
+def preflight(
+    config_path: str,
+    data_path: Optional[str],
+    prompt_count: Optional[int],
+    p50_prompt_tokens: Optional[int],
+    p95_prompt_tokens: Optional[int],
+    max_prompt_tokens: Optional[int],
+    target_hidden_size: Optional[int],
+    aux_layer_ids: Optional[str],
+    capture_tps: float,
+    swa_pool_tokens: Optional[int],
+    external_store_bytes: Optional[int],
+    max_rows: int,
+    allow_existing: bool,
+    json_output: bool,
+    overrides: Sequence[str],
+) -> int:
+    """Check config, dataset shape, capture budget, and feature-store size."""
+    from specforge.application import resolve_run
+    from specforge.preflight import (
+        load_prompt_stats,
+        merge_prompt_stats,
+        run_preflight,
+    )
+
+    try:
+        cfg = load_config(config_path, list(overrides))
+        resolved = resolve_run(cfg)
+        explicit_data = data_path is not None
+        selected_path = data_path
+        if selected_path is None and cfg.mode == "online":
+            selected_path = cfg.data.prompts_path or cfg.data.train_data_path
+        stats = None
+        if selected_path and (
+            explicit_data or os.path.exists(os.path.expanduser(selected_path))
+        ):
+            stats = load_prompt_stats(selected_path, max_rows=max_rows)
+        stats = merge_prompt_stats(
+            stats,
+            count=prompt_count,
+            p50=p50_prompt_tokens,
+            p95=p95_prompt_tokens,
+            maximum=max_prompt_tokens,
+        )
+        contract = None
+        if (target_hidden_size is None) != (aux_layer_ids is None):
+            raise click.UsageError(
+                "--target-hidden-size and --aux-layer-ids must be set together",
+                ctx=click.get_current_context(),
+            )
+        if target_hidden_size is not None:
+            from specforge.training.capture_contract import ServerCaptureContract
+
+            try:
+                layers = tuple(
+                    int(item) for item in aux_layer_ids.split(",") if item.strip()
+                )
+            except ValueError as exc:
+                raise click.UsageError(
+                    "--aux-layer-ids must be comma-separated integers",
+                    ctx=click.get_current_context(),
+                ) from exc
+            if not layers:
+                raise click.UsageError(
+                    "--aux-layer-ids must not be empty",
+                    ctx=click.get_current_context(),
+                )
+            contract = ServerCaptureContract(
+                method="preflight-override",
+                aux_layer_ids=layers,
+                target_hidden_size=target_hidden_size,
+                target_vocab_size=0,
+                draft_vocab_size=0,
+            )
+        report = run_preflight(
+            resolved.config,
+            resolved.algorithm,
+            contract=contract,
+            prompt_stats=stats,
+            capture_tps=capture_tps,
+            swa_pool_tokens=swa_pool_tokens,
+            allow_existing=allow_existing,
+            external_store_bytes=external_store_bytes,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(report.as_dict(), indent=2, sort_keys=True)
+        if json_output
+        else report.render()
+    )
+    return 0 if report.ok else 1
+
+
+@cli.command(short_help="simulate the online capture/training path on CPU")
+@click.option("-c", "--config", "config_path", required=True, metavar="PATH")
+@click.option(
+    "--work-dir",
+    default=None,
+    metavar="PATH",
+    help="Scratch directory for the reference channel and ledger.",
+)
+@click.option(
+    "--prompt-count",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Synthetic prompt count; 0 uses two dispatch windows (capped at 512).",
+)
+@click.option(
+    "--tokens-per-prompt",
+    type=int,
+    default=None,
+    help="Tokens per synthetic prompt; defaults to data.max_length.",
+)
+@click.option(
+    "--bytes-per-token",
+    type=int,
+    default=40976,
+    show_default=True,
+    help="Synthetic capture bytes per token, from specforge preflight.",
+)
+@click.option("--refs-per-window", type=int, default=None)
+@click.option("--target-hidden-size", type=int, default=None)
+@click.option("--aux-layer-ids", default=None, metavar="ID,ID,...")
+@click.option("--timeout-s", type=float, default=600.0, show_default=True)
+@click.option(
+    "--consumer-delay-ms",
+    type=float,
+    default=2.0,
+    show_default=True,
+    help="Per-batch consumer pause, to exercise producer backpressure.",
+)
+@click.option("--no-restart-check", is_flag=True)
+@click.option("--json-output", is_flag=True)
+@click.argument("overrides", nargs=-1)
+def simulate(
+    config_path: str,
+    work_dir: Optional[str],
+    prompt_count: int,
+    tokens_per_prompt: Optional[int],
+    bytes_per_token: int,
+    refs_per_window: Optional[int],
+    target_hidden_size: Optional[int],
+    aux_layer_ids: Optional[str],
+    timeout_s: float,
+    consumer_delay_ms: float,
+    no_restart_check: bool,
+    json_output: bool,
+    overrides: Sequence[str],
+) -> int:
+    """Run the real producer, channel, ledger and dedup path without a GPU."""
+    import tempfile
+
+    from specforge.application import resolve_run
+    from specforge.simulate import run_simulation
+
+    try:
+        cfg = load_config(config_path, list(overrides))
+        resolved = resolve_run(cfg)
+        layers: tuple[int, ...] = ()
+        if aux_layer_ids is not None:
+            try:
+                layers = tuple(
+                    int(item) for item in aux_layer_ids.split(",") if item.strip()
+                )
+            except ValueError as exc:
+                raise click.UsageError(
+                    "--aux-layer-ids must be comma-separated integers",
+                    ctx=click.get_current_context(),
+                ) from exc
+        hidden = target_hidden_size
+        if hidden is None or not layers:
+            try:
+                from specforge.training.capture_contract import (
+                    resolve_server_capture_contract,
+                )
+
+                contract = resolve_server_capture_contract(
+                    resolved.config, algorithm=resolved.algorithm
+                )
+                hidden = hidden or contract.target_hidden_size
+                layers = layers or tuple(contract.aux_layer_ids)
+            except Exception as exc:  # noqa: BLE001 - explicit flags avoid this
+                if hidden is None or not layers:
+                    raise click.UsageError(
+                        "could not resolve the capture contract without a local "
+                        "checkpoint; pass --target-hidden-size and "
+                        f"--aux-layer-ids ({exc})",
+                        ctx=click.get_current_context(),
+                    ) from exc
+        scratch = work_dir or tempfile.mkdtemp(prefix="specforge-simulate-")
+        report = run_simulation(
+            resolved.config,
+            resolved.algorithm,
+            work_dir=scratch,
+            prompt_count=prompt_count,
+            tokens_per_prompt=tokens_per_prompt,
+            bytes_per_token=bytes_per_token,
+            dispatch_refs=refs_per_window,
+            target_hidden_size=int(hidden),
+            aux_layer_ids=layers,
+            timeout_s=timeout_s,
+            check_restart=not no_restart_check,
+            consumer_delay_s=consumer_delay_ms / 1000.0,
+        )
+        report.metrics["work_dir"] = scratch
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(report.as_dict(), indent=2, sort_keys=True)
+        if json_output
+        else report.render()
+    )
+    return 0 if report.ok else 1
 
 
 @cli.command(short_help="materialize a runtime checkpoint as a model directory")

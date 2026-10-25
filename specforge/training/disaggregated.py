@@ -700,6 +700,7 @@ def _build_online(
                 algorithm=algorithm.name,
                 schema=capture_schema,
                 request_input_adapter=input_adapter,
+                timeout_s=cfg.deployment.disaggregated.capture_timeout_s,
                 target_model_version=cfg.model.target_model_path,
                 server_capture=_server_capture(cfg),
             )

@@ -868,6 +868,9 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)
     peer_wait_timeout_s: Optional[float] = Field(default=None, gt=0)
     producer_hold_s: Optional[float] = Field(default=None, gt=0)
+    #: HTTP timeout for one capture request. A request holds one producer
+    #: lease, so long prompts need enough budget for the whole lease.
+    capture_timeout_s: float = Field(default=3600.0, gt=0)
     #: Online consumer: run each optimizer boundary's durable ack (ledger
     #: commit, feature removes, DP ack collectives over a dedicated Gloo group)
     #: on a background thread while the next step computes. The durable marker

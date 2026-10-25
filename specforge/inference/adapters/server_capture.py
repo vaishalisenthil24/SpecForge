@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -46,6 +47,21 @@ logger = logging.getLogger(__name__)
 #: How a capture server implements spec capture: the versioned source patch or
 #: the SGLang plugin. Each takes the request spec through a different field.
 SERVER_CAPTURE_BACKENDS = ("patch", "plugin")
+
+
+def resolve_capture_timeout_s(configured: Optional[float] = None) -> float:
+    """Effective HTTP timeout for one capture request.
+
+    ``SPECFORGE_CAPTURE_TIMEOUT_S`` wins so a running box can recover from a
+    bad config, matching the historical environment escape hatch.
+    """
+    raw = os.environ.get("SPECFORGE_CAPTURE_TIMEOUT_S")
+    value = float(raw) if raw is not None and raw.strip() else configured
+    if value is None:
+        value = 3600.0
+    if value <= 0:
+        raise ValueError("capture timeout must be positive")
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -164,7 +180,7 @@ class SGLangServerCaptureAdapter:
         algorithm: str,
         schema: ServerCaptureSchema,
         request_input_adapter=None,
-        timeout_s: float = 300.0,
+        timeout_s: Optional[float] = None,
         post_fn: Optional[Callable[..., Any]] = None,
         target_model_version: str = "unknown",
         server_capture: str = "patch",
@@ -204,7 +220,7 @@ class SGLangServerCaptureAdapter:
                 "request_input_adapter must expose build_request_inputs(tasks)"
             )
         self.request_input_adapter = request_input_adapter
-        self.timeout_s = timeout_s
+        self.timeout_s = resolve_capture_timeout_s(timeout_s)
         self.post_fn = post_fn or _SessionPost()
         self.target_model_version = target_model_version
         self.server_capture = server_capture

@@ -22,6 +22,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any, Dict, List
+from unittest import mock
 
 import torch
 
@@ -31,6 +32,7 @@ from specforge.inference.adapters.server_capture import (
     ServerCaptureFailure,
     ServerCaptureSchema,
     SGLangServerCaptureAdapter,
+    resolve_capture_timeout_s,
 )
 from specforge.inference.capture import (
     CaptureConfig,
@@ -1096,6 +1098,22 @@ class TestServerCaptureProducerWiring(unittest.TestCase):
         self.assertEqual(produced, len(prompts))
         self.assertEqual(channel.published, len(prompts))
         self.assertTrue(channel.is_closed())
+
+
+class TestCaptureTimeout(unittest.TestCase):
+    def test_config_default_and_environment_override(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(resolve_capture_timeout_s(), 3600.0)
+            self.assertEqual(resolve_capture_timeout_s(120.0), 120.0)
+        with mock.patch.dict(
+            os.environ, {"SPECFORGE_CAPTURE_TIMEOUT_S": "7200"}, clear=True
+        ):
+            self.assertEqual(resolve_capture_timeout_s(120.0), 7200.0)
+        with mock.patch.dict(
+            os.environ, {"SPECFORGE_CAPTURE_TIMEOUT_S": "0"}, clear=True
+        ):
+            with self.assertRaises(ValueError):
+                resolve_capture_timeout_s(120.0)
 
 
 if __name__ == "__main__":
